@@ -19,6 +19,12 @@ def test_i_ordem_logs_colisao_antes_done(tmp_path: Path):
     ex.executar([op], modo_preview=False)
 
     msgs = [r.mensagem for r in monitor.obter_registos()]
+
+    i_antes = next(i for i, m in enumerate(msgs) if m.startswith("ANTES MOVER:"))
     i_col = next(i for i, m in enumerate(msgs) if "Colisão no destino" in m)
-    i_done = next(i for i, m in enumerate(msgs) if m.startswith("DONE:"))
-    assert i_col < i_done
+    i_mover = next(i for i, m in enumerate(msgs) if m.startswith("MOVER:"))
+
+    assert i_antes < i_col < i_mover
+
+    # opcional: confirma que o nome gerado aparece no warning
+    assert any("SafeRename -> a (1).jpg" in m for m in msgs)

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional, Set, Literal
+from typing import Iterable, Optional, Set, List
 
 from classes.monitor_de_operacoes import MonitorDeOperacoes, MonitorProtocol
 from classes.operacao import Operacao, TipoOperacao
 
 
-StatusOp = Literal["MOVIDA", "SKIPPED", "ERRO", "PREVIEW"]
-
+# -------------------------
+# Modelos de resultado
+# -------------------------
 
 @dataclass
 class ResultadoExecucao:
@@ -20,92 +21,88 @@ class ResultadoExecucao:
     erros: int
 
 
-class ExecutorDeOperacoes:
+@dataclass
+class ExecResultadoOp:
+    status: str  # "MOVED" | "SKIPPED" | "ERROR"
+    motivo: str
+    destino_final: Optional[Path] = None
+    avisos: List[str] = field(default_factory=list)
+
+
+# -------------------------
+# Mixins cooperativos
+# -------------------------
+
+class LogMixin:
     """
-    Base (sem comportamento transversal):
-      - validações mínimas
-      - I/O real (mover)
-      - criação de diretórios (com cache)
-    Logging e SafeRename são adicionados por mixins cooperativos.
+    Logging transversal (antes / depois / erro) via MonitorProtocol.
+    Cooperativo: interceta executar_operacao e chama super().
     """
 
-    def __init__(self, monitor: Optional[MonitorProtocol] = None) -> None:
-        self._monitor: MonitorProtocol = monitor or MonitorDeOperacoes()
-        self._dirs_criadas: Set[Path] = set()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
 
-    @property
-    def monitor(self) -> MonitorProtocol:
-        return self._monitor
+    _monitor: MonitorProtocol  # esperado no self
 
-    def executar(self, operacoes: Iterable[Operacao], modo_preview: bool = False) -> ResultadoExecucao:
-        total = movidas = skipped = erros = 0
+    def executar_operacao(
+        self,
+        op: Operacao,
+        modo_preview: bool = False,
+        destino_override: Optional[Path] = None,
+    ) -> ExecResultadoOp:
+        origem = op.origem
+        destino_planeado = destino_override or op.destino
 
-        for op in operacoes:
-            total += 1
-            status = self._executar_pipeline(op, modo_preview)
-
-            if status in ("MOVIDA", "PREVIEW"):
-                movidas += 1
-            elif status == "SKIPPED":
-                skipped += 1
-            else:
-                erros += 1
-
-        return ResultadoExecucao(total=total, movidas=movidas, skipped=skipped, erros=erros)
-
-    def _executar_pipeline(self, op: Operacao, modo_preview: bool) -> StatusOp:
-        # SKIP explícito
-        if op.tipo == TipoOperacao.SKIP:
-            return "SKIPPED"
-
-        # só suportamos MOVER (por agora)
-        if op.tipo != TipoOperacao.MOVER:
-            op.motivo = f"Tipo não suportado: {op.tipo}"
-            return "SKIPPED"
-
-        # preview: não toca no disco
-        if modo_preview:
-            return "PREVIEW"
-
-        # validação de origem: não rebenta, faz SKIP
-        if not op.origem.exists() or not op.origem.is_file():
-            op.motivo = "origem não existe ou não é ficheiro"
-            return "SKIPPED"
-
-        # I/O real (safe rename pode interferir aqui via mixin)
-        self.executar_operacao(op)
-        return "MOVIDA"
-
-    def executar_operacao(self, op: Operacao) -> None:
-        destino = op.destino
-        self._ensure_dir(destino.parent)
-        shutil.move(str(op.origem), str(destino))
-
-    def _ensure_dir(self, pasta: Path) -> None:
-        p = pasta.resolve()
-        if p in self._dirs_criadas:
-            return
-        p.mkdir(parents=True, exist_ok=True)
-        self._dirs_criadas.add(p)
-
-
-class SafeRenameMixin:
-    """Resolve colisões no destino e chama super() (mixin cooperativo)."""
-
-    def executar_operacao(self, op: Operacao) -> None:
-        destino = op.destino
-
-        # se existir, calcula nome alternativo e MUTa op.destino
-        if destino.exists():
-            novo = self._safe_rename(destino)
-            op.destino = novo
+        # "antes" (só faz sentido para MOVER)
+        if op.tipo == TipoOperacao.MOVER and not modo_preview:
             self._monitor.registar(
-                f"Colisão no destino; SafeRename -> {novo.name}",
-                nivel="WARN",
+                f"ANTES MOVER: {origem} -> {destino_planeado}",
+                nivel="INFO",
                 operacao=op,
             )
 
-        return super().executar_operacao(op)  # type: ignore[misc]
+        res = super().executar_operacao(op, modo_preview=modo_preview, destino_override=destino_override)
+
+        # avisos (ex.: colisão resolvida)
+        for aviso in res.avisos:
+            self._monitor.registar(aviso, nivel="WARN", operacao=op)
+
+        # logs principais
+        if res.status == "SKIPPED":
+            self._monitor.registar(f"SKIP: {res.motivo}", nivel="INFO", operacao=op)
+            return res
+
+        if res.status == "ERROR":
+            self._monitor.registar(f"ERRO: {res.motivo}", nivel="ERROR", operacao=op)
+            return res
+
+        # MOVED
+        destino_final = res.destino_final or destino_planeado
+        if modo_preview:
+            self._monitor.registar(
+                f"PREVIEW MOVER: {origem} -> {destino_final}",
+                nivel="INFO",
+                operacao=op,
+            )
+        else:
+            # "depois"
+            self._monitor.registar(
+                f"MOVER: {origem} -> {destino_final}",
+                nivel="INFO",
+                operacao=op,
+            )
+
+        return res
+
+
+class SafeRenameMixin:
+    """
+    Renome seguro em colisões.
+    Cooperativo: interceta executar_operacao e chama super().
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
 
     def _safe_rename(self, destino: Path) -> Path:
         base = destino.stem
@@ -119,46 +116,106 @@ class SafeRenameMixin:
                 return candidato
             i += 1
 
+    def executar_operacao(
+        self,
+        op: Operacao,
+        modo_preview: bool = False,
+        destino_override: Optional[Path] = None,
+    ) -> ExecResultadoOp:
+        destino = destino_override or op.destino
 
-class LogMixin:
-    """Logging transversal cooperativo (antes/depois/erro + preview/skip)."""
+        # aplica SafeRename se houver colisão (mesmo em preview, para o plano ser fiel)
+        if op.tipo == TipoOperacao.MOVER and destino.exists():
+            novo = self._safe_rename(destino)
+            res = super().executar_operacao(op, modo_preview=modo_preview, destino_override=novo)
+            res.avisos.append(f"Colisão no destino; SafeRename -> {novo.name}")
+            return res
 
-    def _executar_pipeline(self, op: Operacao, modo_preview: bool) -> StatusOp:
+        return super().executar_operacao(op, modo_preview=modo_preview, destino_override=destino_override)
+
+
+# -------------------------
+# Executor base (core)
+# -------------------------
+
+class ExecutorDeOperacoes:
+    """
+    Core do executor: validações, preview, criação de diretórios, I/O (move).
+    Não faz logging nem SafeRename aqui — isso vem pelos mixins.
+    """
+
+    def __init__(self, monitor: Optional[MonitorProtocol] = None, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._monitor: MonitorProtocol = monitor or MonitorDeOperacoes()
+        self._dirs_criadas: Set[Path] = set()
+
+    @property
+    def monitor(self) -> MonitorProtocol:
+        return self._monitor
+
+    def executar(self, operacoes: Iterable[Operacao], modo_preview: bool = False) -> ResultadoExecucao:
+        total = movidas = skipped = erros = 0
+
+        for op in operacoes:
+            total += 1
+            res = self.executar_operacao(op, modo_preview=modo_preview)
+
+            if res.status == "MOVED":
+                movidas += 1
+            elif res.status == "SKIPPED":
+                skipped += 1
+            else:
+                erros += 1
+
+        return ResultadoExecucao(total=total, movidas=movidas, skipped=skipped, erros=erros)
+
+    def executar_operacao(
+        self,
+        op: Operacao,
+        modo_preview: bool = False,
+        destino_override: Optional[Path] = None,
+    ) -> ExecResultadoOp:
+        # 1) tipo
+        if op.tipo == TipoOperacao.SKIP:
+            return ExecResultadoOp(status="SKIPPED", motivo=op.motivo or "SKIP")
+
+        if op.tipo != TipoOperacao.MOVER:
+            return ExecResultadoOp(status="SKIPPED", motivo=f"tipo não suportado ({op.tipo})")
+
+        origem = op.origem
+        destino = destino_override or op.destino
+
+        # 2) valida origem
+        if not origem.exists() or not origem.is_file():
+            return ExecResultadoOp(status="SKIPPED", motivo="origem não existe ou não é ficheiro")
+
+        # 3) preview não mexe no disco
+        if modo_preview:
+            return ExecResultadoOp(status="MOVED", motivo="PREVIEW", destino_final=destino)
+
+        # 4) execução real
         try:
-            status = super()._executar_pipeline(op, modo_preview)  # type: ignore[misc]
-
-            if status == "PREVIEW":
-                self._monitor.registar(
-                    f"PREVIEW MOVER: {op.origem} -> {op.destino}",
-                    nivel="INFO",
-                    operacao=op,
-                )
-                return status
-
-            if status == "SKIPPED":
-                self._monitor.registar(f"SKIP: {op.motivo}", nivel="INFO", operacao=op)
-                return status
-
-            return status  # MOVIDA (logs do move vêm de executar_operacao)
-
+            self._ensure_dir(destino.parent)
+            shutil.move(str(origem), str(destino))
+            return ExecResultadoOp(status="MOVED", motivo="OK", destino_final=destino)
         except Exception as e:
-            self._monitor.registar(f"ERRO: {type(e).__name__}: {e}", nivel="ERROR", operacao=op)
-            return "ERRO"
+            return ExecResultadoOp(status="ERROR", motivo=f"{type(e).__name__}: {e}", destino_final=destino)
 
-    def executar_operacao(self, op: Operacao) -> None:
-        # antes (destino ainda é o planeado)
-        self._monitor.registar(f"MOVER: {op.origem} -> {op.destino}", nivel="INFO", operacao=op)
+    def _ensure_dir(self, pasta: Path) -> None:
+        p = pasta.resolve()
+        if p in self._dirs_criadas:
+            return
+        p.mkdir(parents=True, exist_ok=True)
+        self._dirs_criadas.add(p)
 
-        # aqui entra SafeRenameMixin (se estiver na MRO)
-        super().executar_operacao(op)  # type: ignore[misc]
 
-        # depois (destino pode ter sido mutado para a versão safe)
-        self._monitor.registar(f"DONE: {op.origem.name} -> {op.destino}", nivel="INFO", operacao=op)
-
+# -------------------------
+# Hierarquia “complexa” (AF6.2)
+# -------------------------
 
 class ExecutorSeguro(LogMixin, SafeRenameMixin, ExecutorDeOperacoes):
     """
-    MRO:
-      ExecutorSeguro -> LogMixin -> SafeRenameMixin -> ExecutorDeOperacoes -> object
+    Combina comportamentos via herança múltipla.
+    MRO esperada: LogMixin -> SafeRenameMixin -> ExecutorDeOperacoes -> object
     """
     pass
