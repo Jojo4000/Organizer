@@ -120,8 +120,7 @@ class SafeRenameMixin:
         self,
         op: Operacao,
         modo_preview: bool = False,
-        destino_override: Optional[Path] = None,
-    ) -> ExecResultadoOp:
+        destino_override: Optional[Path] = None,) -> ExecResultadoOp:
         destino = destino_override or op.destino
 
         # aplica SafeRename se houver colisão (mesmo em preview, para o plano ser fiel)

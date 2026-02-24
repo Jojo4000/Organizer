@@ -138,6 +138,90 @@ def perguntar_aplicar(pergunta: str = "Aplicar agora as operações? [s/N] ") ->
 
         print("Opção inválida. Responde apenas com: s/S/y/Y (sim) ou n/N (não).")
 
+def preparar_plano(
+    origem: Path,
+    regra: str,
+    precision: int,
+    limite: Optional[int],
+) -> tuple[list[Foto], list, int, Path, str] | int:
+    if not origem.exists() or not origem.is_dir():
+        print(f"ERRO: origem não existe ou não é diretório: {origem}")
+        return 2
+
+    caminhos = listar_ficheiros_foto(origem, limite=limite)
+    if not caminhos:
+        print("Nenhuma foto encontrada (extensões suportadas: jpg/jpeg/png/webp/tif/tiff/heic).")
+        return 0
+
+    # ✅ NOVO: decisão do que fazer com imagens grandes (antes de abrir EXIF/pHash)
+    caminhos_decididos, incluir_grandes, _n_grandes = decidir_tratamento_imagens_grandes(caminhos)
+    if caminhos_decididos is None:
+        # cancelado pelo utilizador
+        return 0
+
+    caminhos = caminhos_decididos
+
+    # ✅ Evita spam de warnings a partir daqui
+    warnings.filterwarnings("ignore", category=PILImage.DecompressionBombWarning)
+
+    # ✅ Se o user aceitou incluir grandes, aumenta o limite
+    if incluir_grandes:
+        PILImage.MAX_IMAGE_PIXELS = 200_000_000  # 200MP
+
+    fotos = construir_fotos(caminhos)
+
+    det = DetetarDuplicados()
+    det.marcar_duplicados(fotos)
+
+    # quase duplicados (se o método existir)
+    if hasattr(det, "marcar_quase_duplicados"):
+        det.marcar_quase_duplicados(fotos, threshold=3)
+
+    n_duplicadas = sum(1 for f in fotos if f.duplicada)
+
+    if regra == "data":
+        regra_obj = RegraPorData()
+    elif regra == "local":
+        regra_obj = RegraPorLocal(precision=precision)
+    else:
+        print(f"ERRO: regra inválida: {regra} (usa 'data' ou 'local')")
+        return 2
+
+    raiz_destino = escolher_raiz_destino(origem)
+    plano = PlanoDeOperacoes(regra=regra_obj, raiz_destino=raiz_destino)
+    operacoes = plano.gerar(fotos)
+
+    return fotos, operacoes, n_duplicadas, raiz_destino, regra
+
+def executar_e_relatar(
+    origem: Path,
+    raiz_destino: Path,
+    regra: str,
+    operacoes,
+    n_duplicadas: int,
+    modo_preview: bool,
+) -> int:
+    monitor = MonitorDeOperacoes()
+    executor = ExecutorSeguro(monitor=monitor)
+    resultado = executor.executar(operacoes, modo_preview=modo_preview)
+
+    resumo = Relatorio().gerar(
+        operacoes=operacoes,
+        resultado=resultado,
+        registos=monitor.obter_registos(),
+        duplicadas=n_duplicadas,
+    )
+
+    modo_txt = "PREVIEW" if modo_preview else "REAL"
+    print(f"\n=== Foto_Organizada | modo={modo_txt} | regra={regra} ===")
+    print(f"Origem: {origem}")
+    print(f"Destino: {raiz_destino}")
+    print(f"Operações: total={resumo.total_operacoes} movidas={resumo.movidas} skipped={resumo.skipped} erros={resumo.erros}")
+    print(f"Duplicadas: {resumo.duplicadas}")
+    print(f"Logs: info={resumo.logs_info} warn={resumo.logs_warn} error={resumo.logs_error}")
+
+    return 0
+
 def run(
     origem: Path,
     modo_preview: bool,
@@ -169,7 +253,7 @@ def run(
     det = DetetarDuplicados()
     det.marcar_duplicados(fotos)  # exatos
 
-    # pHash só faz sentido se o método existir e se não estamos a evitar grandes por segurança/recursos
+    # pHash só faz sentido se o metodo existir e se não estamos a evitar grandes por segurança/recursos
     if hasattr(det, "marcar_quase_duplicados"):
         # Se escolheste "ignorar grandes", elas já nem vêm nos caminhos => pHash corre no resto na mesma.
         det.marcar_quase_duplicados(fotos, threshold=3)
@@ -246,53 +330,46 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    # Primeiro: listar caminhos e decidir tratamento das grandes (uma vez só)
-    if not args.origem.exists() or not args.origem.is_dir():
-        print(f"ERRO: origem não existe ou não é diretório: {args.origem}")
-        return 2
-
-    caminhos = listar_ficheiros_foto(args.origem, limite=args.limite)
-    if not caminhos:
-        print("Nenhuma foto encontrada (extensões suportadas: jpg/jpeg/png/webp/tif/tiff/heic).")
-        return 0
-
-    caminhos_decididos, incluir_grandes, _n_grandes = decidir_tratamento_imagens_grandes(caminhos)
-    if caminhos_decididos is None:
-        # cancelado pelo utilizador
-        return 0
-
-    # 1) Preview sempre (com o conjunto escolhido)
-    code = run(
+    prep = preparar_plano(
         origem=args.origem,
-        modo_preview=True,
         regra=args.regra,
         precision=args.precision,
         limite=args.limite,
-        caminhos=caminhos_decididos,
-        incluir_grandes=incluir_grandes,
+    )
+    if isinstance(prep, int):
+        return prep
+
+    fotos, operacoes, n_duplicadas, raiz_destino, regra = prep
+
+    # 1) Preview (usando o plano já calculado)
+    code = executar_e_relatar(
+        origem=args.origem,
+        raiz_destino=raiz_destino,
+        regra=regra,
+        operacoes=operacoes,
+        n_duplicadas=n_duplicadas,
+        modo_preview=True,
     )
     if code != 0:
         return code
 
-    # 2) Decisão (preview -> real)
+    # 2) Decisão
     auto_aplicar = args.yes or (args.modo == "real")
-
     if not auto_aplicar:
-        aplicar = perguntar_aplicar()
-        if not aplicar:
+        if not perguntar_aplicar():
             print("Ok — mantido em preview. Nenhuma alteração foi aplicada.")
             return 0
 
-    # 3) Execução real (mesmo conjunto escolhido)
-    return run(
+    # 3) REAL (reutiliza exatamente o mesmo plano — sem recalcular nada)
+    return executar_e_relatar(
         origem=args.origem,
+        raiz_destino=raiz_destino,
+        regra=regra,
+        operacoes=operacoes,
+        n_duplicadas=n_duplicadas,
         modo_preview=False,
-        regra=args.regra,
-        precision=args.precision,
-        limite=args.limite,
-        caminhos=caminhos_decididos,
-        incluir_grandes=incluir_grandes,
     )
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
